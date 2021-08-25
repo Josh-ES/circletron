@@ -18,8 +18,32 @@ const DEFAULT_RUN_ONLY_CHANGED_ON_TARGET_BRANCHES = false
 
 const pReadFile = promisify(readFile)
 
+interface CircleParameter {
+  type: string
+  default?: string
+}
+
+interface CircleJobDefinition {
+  conditional?: boolean
+  executor?: string
+  parameters?: Record<string, CircleParameter>
+}
+
+interface CircleWorkflowJob {
+  context?: string | string[]
+  filters?: any
+  name?: string
+  requires?: string[]
+}
+
+interface CircleWorkflow {
+  jobs: Record<string, CircleWorkflowJob>[]
+}
+
 interface CircleConfig {
   dependencies?: string[]
+  jobs?: Record<string, CircleJobDefinition>
+  workflows?: Record<string, CircleWorkflow>
   [k: string]: unknown
 }
 
@@ -130,18 +154,6 @@ const getTriggerPackages = async (
   )
 }
 
-interface CircleParameter {
-  type: string
-  default?: string
-}
-
-interface CircleJob {
-  conditional?: boolean
-  name?: string
-  parameters?: Record<string, CircleParameter>
-  working_directory?: string
-}
-
 const SKIP_JOB = {
   docker: [{ image: 'busybox:stable' }],
   steps: [
@@ -153,6 +165,8 @@ const SKIP_JOB = {
     },
   ],
 }
+
+const SKIP_JOB_NAME: string = 'circletron_skip_job'
 
 async function buildConfiguration(
   packages: Package[],
@@ -185,16 +199,16 @@ async function buildConfiguration(
   }
   const jobsConfig = config.jobs
 
+  jobsConfig[SKIP_JOB_NAME] = SKIP_JOB
+
   for (const pkg of packages) {
     const { circleConfig } = pkg
-
-    mergeObject('workflows', circleConfig)
     mergeObject('orbs', circleConfig)
     mergeObject('executors', circleConfig)
     mergeObject('commands', circleConfig)
 
     // jobs may be missing from circle config if all workflow jobs are from orbs
-    const jobs = circleConfig.jobs as Record<string, CircleJob>
+    const jobs: Record<string, CircleJobDefinition> | undefined = { ...circleConfig.jobs }
     for (const [jobName, jobData] of Object.entries(jobs ?? {})) {
       if (jobsConfig[jobName]) {
         throw new Error(`Two jobs with the same name: ${jobName}`)
@@ -215,6 +229,40 @@ async function buildConfiguration(
             parameters: jobData.parameters,
           }
     }
+
+    // Manipulate the workflows to skip jobs that are either:
+    // - shared but outside of a trigger package
+    // - defined by an orb
+    if (!triggerPackages.has(pkg.name)) {
+      for (const workflowName in circleConfig.workflows) {
+        for (const [i, jobRecord] of circleConfig.workflows[workflowName].jobs.entries()) {
+          for (const [jobName, job] of Object.entries(jobRecord)) {
+            // If the job is not defined within this package's Circle configuration,
+            // we assume that it is either shared, something along the lines of a 'hold'
+            // job, or defined by an orb
+            if (!circleConfig.jobs || !(jobName in circleConfig.jobs)) {
+              const skipReplacementJob: CircleWorkflowJob = {
+                // if the job has a custom name, we should inherit it, otherwise fallback
+                // to the job's 'key'
+                name: job.name || jobName,
+              }
+
+              // if the job has filters or required jobs, set those to the skip job
+              if (job.filters) skipReplacementJob.filters = job.filters
+              if (job.requires) skipReplacementJob.requires = job.requires
+
+              const skipJobConfiguration: Record<string, CircleWorkflowJob> = {
+                [SKIP_JOB_NAME]: skipReplacementJob,
+              }
+
+              circleConfig.workflows[workflowName].jobs[i] = skipJobConfiguration
+            }
+          }
+        }
+      }
+    }
+
+    mergeObject('workflows', circleConfig)
   }
   return yamlStringify(config)
 }
